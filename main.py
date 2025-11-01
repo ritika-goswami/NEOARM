@@ -56,7 +56,7 @@ VISION_SERVER_HOST = "0.0.0.0"  # Listen on all interfaces
 VISION_SERVER_PORT = 9999
 category_queue = queue.Queue() # Thread-safe queue for communication
 
-# --- NEW: LED Configuration ---
+# --- NEW: LED Configuration (Using BCM pins) ---
 LED_RED_PIN = 25   # (BCM 25 for Red) <-- NEW
 LED_BLUE_PIN = 26  # (BCM 26 for Blue) <-- NEW
 DELAY_SECONDS = 40.0 # <-- NEW
@@ -104,6 +104,7 @@ class SimpleServoController:
         max_delta = max(abs(cur[p] - tgs[p]) for p in self.pins)
         steps = max(1, int(max_delta / max(1e-6, step_deg)))
         for _ in range(steps):
+            if stop_flag.is_set(): return # <-- NEW: Added check to stop move early
             done = True
             for p in self.pins:
                 if abs(cur[p] - tgs[p]) < 1e-6:
@@ -121,12 +122,14 @@ class SimpleServoController:
             if done:
                 break
             time.sleep(step_delay)
-        for p in self.pins:
-            try:
-                self.pi.set_servo_pulsewidth(p, angle_to_pulse(tgs[p]))
-                self.current[p] = float(tgs[p])
-            except Exception:
-                pass
+        # Set final exact positions
+        if not stop_flag.is_set(): # <-- NEW: Only set final if not stopping
+            for p in self.pins:
+                try:
+                    self.pi.set_servo_pulsewidth(p, angle_to_pulse(tgs[p]))
+                    self.current[p] = float(tgs[p])
+                except Exception:
+                    pass
 
     def smooth_open(self, step_deg=STEP_DEG, step_delay=STEP_DELAY):
         targets = {p: float(OPEN_ANGLE) for p in self.pins}
@@ -173,7 +176,8 @@ def serial_thread_fn(port, baud):
                             except Exception: pass
                     except Exception: continue
         except Exception as e:
-            print("[SERIAL] Serial open/read error:", e); time.sleep(2.0)
+            if not stop_flag.is_set():
+                print("[SERIAL] Serial open/read error:", e); time.sleep(2.0)
 
 # --- NEW: Vision Server Thread ---
 def _vision_server_thread_fn():
@@ -182,6 +186,7 @@ def _vision_server_thread_fn():
     and puts it in the queue for the main thread to handle.
     """
     global category_queue
+    server_socket = None # Define server_socket here
     try:
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -216,7 +221,7 @@ def _vision_server_thread_fn():
         if not stop_flag.is_set():
             print(f"\n[Vision Server] Thread error: {e}")
     finally:
-        if 'server_socket' in locals():
+        if server_socket: # Check if it exists before closing
             server_socket.close()
         print("[Vision Server] Shutting down.")
 
@@ -279,8 +284,6 @@ def finger_actuation_loop(servo_ctrl: SimpleServoController, finger_pins):
                     for idx, p in enumerate(finger_pins):
                         if reached[p]: continue
                         val = fsr_vals[idx] if idx < len(fsr_vals) else 0
-                        # --- THIS IS THE KEY ---
-                        # It automatically uses the new THRESHOLDS variable
                         if val >= THRESHOLDS[idx]: 
                             reached[p] = True
                             print(f"[GRIP] finger {idx} reached threshold ({val} >= {THRESHOLDS[idx]})")
@@ -333,7 +336,7 @@ def main():
     th_serial.start()
     print("[MAIN] Serial thread started.")
 
-    # Start pigpio (UNCHANGED)
+    # Start pigpio (UNCHANGSSED)
     pi = pigpio.pi()
     if not pi.connected:
         print("[MAIN] pigpio not connected. Start pigpiod and retry (sudo pigpiod).")
@@ -365,86 +368,4 @@ def main():
         button_cb = pi.callback(BUTTON_PIN, pigpio.FALLING_EDGE, _pigpio_button_cb)
         print(f"[MAIN] Button set on GPIO{BUTTON_PIN} via pigpio (FALLING -> callback).")
     except Exception as e:
-        print("[MAIN] Failed to setup button via pigpio:", e); button_cb = None
-
-    # Start actuation threads (UNCHANGED)
-    th_fingers = threading.Thread(target=finger_actuation_loop, args=(servo_ctrl, FINGER_PINS), daemon=True)
-    th_we = threading.Thread(target=wrist_elbow_loop, args=(servo_ctrl, WRIST_ELBOW_PINS, ADC_CHANNELS), daemon=True)
-    th_fingers.start(); th_we.start()
-    print("[MAIN] Actuation threads started (fingers, wrist/elbow).")
-    
-    # --- NEW: Start the Vision Server Thread ---
-    th_vision = threading.Thread(target=_vision_server_thread_fn, daemon=True) # <-- NEW
-    th_vision.start() # <-- NEW
-    print("[MAIN] Vision server thread started (listening for category).") # <-- NEW
-
-    # Graceful shutdown handling (MODIFIED to include LED cleanup)
-    def shutdown(signum=None, frame=None):
-        print("\n[MAIN] Shutdown signal received. Cleaning up...")
-        stop_flag.set()
-        try:
-            if button_cb is not None: button_cb.cancel()
-        except Exception: pass
-        try: # <-- NEW
-            pi.write(LED_RED_PIN, 0)
-            pi.write(LED_BLUE_PIN, 0)
-        except Exception: pass
-        try: servo_ctrl.cleanup()
-        except Exception: pass
-        try: pi.stop()
-        except Exception: pass
-        print("[MAIN] Clean exit.")
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
-
-    # Keep alive loop (MODIFIED to check the queue and control LEDs/Delay)
-    try:
-        while True:
-            # --- NEW LOGIC START ---
-            try:
-                # Check the queue for a new category (non-blocking)
-                category = category_queue.get_nowait()
-                
-                print(f"\n[MAIN] New category received: '{category}'")
-                
-                # 1. Update the global FSR thresholds
-                if category == "soft":
-                    THRESHOLDS = [100, 100, 100, 100, 100]
-                    print("[MAIN] FSR thresholds set to SOFT (100)")
-                    
-                    # 2. Turn on BLUE LED and wait
-                    print(f"[MAIN] Turning BLUE LED ON for {DELAY_SECONDS}s...")
-                    pi.write(LED_BLUE_PIN, 1) # ON
-                    time.sleep(DELAY_SECONDS)
-                    pi.write(LED_BLUE_PIN, 0) # OFF
-                    
-                elif category == "hard":
-                    THRESHOLDS = [200, 200, 200, 200, 200]
-                    print("[MAIN] FSR thresholds set to HARD (200)")
-                    
-                    # 2. Turn on RED LED and wait
-                    print(f"[MAIN] Turning RED LED ON for {DELAY_SECONDS}s...")
-                    pi.write(LED_RED_PIN, 1) # ON
-                    time.sleep(DELAY_SECONDS)
-                    pi.write(LED_RED_PIN, 0) # OFF
-                
-                print("[MAIN] Task delay finished. Awaiting next detection.")
-                    
-            except queue.Empty:
-                # This is normal, it just means no new category was sent
-                pass
-            # --- END OF NEW LOGIC ---
-            
-            time.sleep(1.0) # Original main loop sleep
-            
-    except SystemExit:
-        pass
-    except Exception as e:
-        print("[MAIN] Unexpected error:", e)
-    finally:
-        shutdown()
-
-if __name__ == "__main__":
-    main()
+        print("[MAIN] Failed to setup button via pigpio:", e);
